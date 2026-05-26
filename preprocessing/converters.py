@@ -64,3 +64,63 @@ def primus_to_record(
         "category": scenario,
         "id": record_id,
     }
+
+
+def triplet_to_record(
+    row: dict,
+    source: str,
+    no_system: bool = False,
+) -> dict:
+    """Trendyol / Fenrir：system/user/assistant 三欄 → record。
+
+    保留資料自帶的 system（--no-system 或 system 為空則不注入）。
+    """
+    system = None if no_system else (str(row.get("system", "")).strip() or None)
+    user = str(row.get("user", "")).strip()
+    assistant = str(row.get("assistant", "")).strip()
+    turns = [
+        {"role": "user", "content": user},
+        {"role": "assistant", "content": assistant},
+    ]
+    return {
+        "messages": _with_system(system, turns),
+        "source": source,
+        "category": None,
+        "id": f"{source}-{row.get('_idx', 0)}",
+    }
+
+
+def _reasoning_to_think(content: str) -> str:
+    """把 {REASON_OPEN}推理{REASON_CLOSE}答案 改寫成 Qwen 原生 <think>…</think>。
+
+    找不到分隔 token 時原樣回傳（fallback）。
+    """
+    if config.REASON_OPEN in content and config.REASON_CLOSE in content:
+        reasoning = (
+            content.split(config.REASON_OPEN, 1)[1].split(config.REASON_CLOSE, 1)[0].strip()
+        )
+        answer = content.split(config.REASON_CLOSE, 1)[1].strip()
+        return f"<think>\n{reasoning}\n</think>\n\n{answer}"
+    return content.strip()
+
+
+def primus_reasoning_to_record(
+    row: dict,
+    system_prompt: Optional[str] = config.REASONING_SYSTEM_PROMPT,
+) -> dict:
+    """Primus-Reasoning：沿用 messages，並把 assistant 的推理轉成 <think> 格式。"""
+    turns = []
+    for t in row.get("messages", []):
+        role = str(t["role"])
+        content = str(t["content"])
+        if role == "assistant":
+            content = _reasoning_to_think(content)
+        turns.append({"role": role, "content": content})
+    variant = row.get("variant")  # o1 / deepseek-r1（兩種推理來源並存，不互相去重）
+    source = f"primus/reasoning-{variant}" if variant else "primus/reasoning"
+    return {
+        "messages": _with_system(system_prompt, turns),
+        "source": source,
+        "category": "reasoning",
+        "id": f"primus-reasoning-{variant or '0'}-{row.get('_idx', 0)}",
+    }

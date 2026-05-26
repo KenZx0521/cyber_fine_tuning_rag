@@ -18,8 +18,18 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from . import config
-from .converters import attackqa_to_record, primus_to_record
-from .loaders import load_attackqa, load_primus
+from .converters import (
+    attackqa_to_record,
+    primus_reasoning_to_record,
+    primus_to_record,
+    triplet_to_record,
+)
+from .loaders import (
+    load_attackqa,
+    load_primus,
+    load_primus_reasoning,
+    load_triplet,
+)
 from .quality import cjk_char_ratio, count_record_tokens, exact_dedup, validate_record
 from .split import stratified_split
 
@@ -53,12 +63,19 @@ def _make_token_counter(hf_tokenizer: Optional[str]) -> Optional[Callable[[str],
 def _collect_records(no_system: bool) -> list[dict]:
     system_attackqa = None if no_system else config.ATTACKQA_SYSTEM_PROMPT
     system_primus = None if no_system else config.SECURITY_SYSTEM_PROMPT
+    system_reasoning = None if no_system else config.REASONING_SYSTEM_PROMPT
 
     records: list[dict] = []
     for row in load_attackqa():
         records.append(attackqa_to_record(row, system_attackqa))
     for scenario, row in load_primus():
         records.append(primus_to_record(scenario, row, system_primus))
+    for row in load_triplet(config.TRENDYOL_DIR):
+        records.append(triplet_to_record(row, "trendyol", no_system))
+    for row in load_triplet(config.FENRIR_DIR):
+        records.append(triplet_to_record(row, "fenrir", no_system))
+    for row in load_primus_reasoning():
+        records.append(primus_reasoning_to_record(row, system_reasoning))
     return records
 
 

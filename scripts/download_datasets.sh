@@ -58,20 +58,28 @@ fetch_finetuning() {
   log "fine-tuning datasets"
   mkdir -p "$DATA/fine-tuning"
 
-  # Primus-Instruct (GATED — needs HF_TOKEN whose account accepted the terms at
-  # https://huggingface.co/datasets/trendmicro-ailab/Primus-Instruct)
+  # --- Gated (trendmicro-ailab) — need HF_TOKEN whose account accepted the dataset terms ---
   if [ -n "${HF_TOKEN:-}" ]; then
+    # Primus-Instruct — https://huggingface.co/datasets/trendmicro-ailab/Primus-Instruct
     if HF_TOKEN="$HF_TOKEN" hf_pull "trendmicro-ailab/Primus-Instruct" "$DATA/fine-tuning/primus-instruct"; then
       ok "Primus-Instruct"
     else
       fail "Primus-Instruct (accept the gate on the dataset page, then retry)"
     fi
+    # Primus-Reasoning — https://huggingface.co/datasets/trendmicro-ailab/Primus-Reasoning
+    if HF_TOKEN="$HF_TOKEN" hf_pull "trendmicro-ailab/Primus-Reasoning" "$DATA/fine-tuning/primus-reasoning"; then
+      ok "Primus-Reasoning"
+    else
+      fail "Primus-Reasoning (accept the gate on the dataset page, then retry)"
+    fi
   else
-    fail "Primus-Instruct skipped — set HF_TOKEN to download the gated dataset"
+    fail "Primus-Instruct / Primus-Reasoning skipped — set HF_TOKEN to download the gated datasets"
   fi
 
-  # AttackQA (open)
+  # --- Open datasets ---
   hf_pull "sambanovasystems/attackqa" "$DATA/fine-tuning/attackqa" && ok "AttackQA" || fail "AttackQA"
+  hf_pull "Trendyol/Trendyol-Cybersecurity-Instruction-Tuning-Dataset" "$DATA/fine-tuning/trendyol" && ok "Trendyol" || fail "Trendyol"
+  hf_pull "AlicanKiraz0/Cybersecurity-Dataset-Fenrir-v2.0" "$DATA/fine-tuning/fenrir" && ok "Fenrir-v2.0" || fail "Fenrir-v2.0"
 }
 
 # ----------------------------------------------------------------------------- RAG
