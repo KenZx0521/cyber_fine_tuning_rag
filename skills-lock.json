@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "skills": {
+    "fine-tuning-expert": {
+      "source": "Jeffallan/claude-skills",
+      "sourceType": "github",
+      "skillPath": "skills/fine-tuning-expert/SKILL.md",
+      "computedHash": "8e70137cf3de9a6edba12d3f523c087c0407002f1206b0981b767323e0f5a54e"
+    },
+    "rag-engineer": {
+      "source": "sickn33/antigravity-awesome-skills",
+      "sourceType": "github",
+      "skillPath": "skills/rag-engineer/SKILL.md",
+      "computedHash": "09a5e174bca621f134235ec59e942499c6298101cc72effda9b7b9046baf6806"
+    },
+    "rag-implementation": {
+      "source": "sickn33/antigravity-awesome-skills",
+      "sourceType": "github",
+      "skillPath": "skills/rag-implementation/SKILL.md",
+      "computedHash": "0c86261f73ff427f4594b9419b1bd8e94a184002d57c8af31fc4ac2e7dbe8fe2"
+    }
+  }
+}

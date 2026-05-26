@@ -1,0 +1,10 @@
+# Data files (datasets, models, RAG corpora, eval sets)
+# Ignore everything under data/ but keep the README documenting its structure.
+/data/*
+!/data/README.md
+
+# Training / download logs
+/logs/
+
+# Model weights & caches (large binary artifacts, e.g. *.gguf)
+/models/
