@@ -1,0 +1,20 @@
+[project]
+name = "cyber-fine-tuning"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "datasets>=4.8.5",
+    "pandas>=3.0.3",
+    "pyarrow>=24.0.0",
+]
+
+# 選用：精確 token 計數（--hf-tokenizer）。預設不安裝，需要時 `uv sync --extra tokenizer`。
+[project.optional-dependencies]
+tokenizer = [
+    "transformers>=4.44",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]
