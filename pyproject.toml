@@ -12,11 +12,12 @@ dependencies = [
     "peft>=0.19.1",
     "pillow>=12.2.0",
     "pyarrow>=24.0.0",
-    "tensorboard>=2.18",
+    "python-dotenv>=1.2.2",
     "torch>=2.12.0",
     "torchvision>=0.27.0",
     "transformers>=5.9.0",
     "trl>=1.5.0",
+    "wandb>=0.27.0",
 ]
 
 # 選用：精確 token 計數（--hf-tokenizer）。預設不安裝，需要時 `uv sync --extra tokenizer`。

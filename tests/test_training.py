@@ -5,12 +5,14 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 
 import pytest
 
 from training import config
 from training.data import build_example_weights, load_sampler_weights
+from training.train import build_sft_config, configure_wandb
 from training.weighted_trainer import make_weighted_sampler
 
 
@@ -138,3 +140,83 @@ def test_template_masks_all_assistant_turns_in_multiturn(train_tokenizer):
     assert "ANSWER_TWO" in masked
     assert "USER_ONE" not in masked
     assert "USER_TWO" not in masked
+
+
+# --- wandb 監控設定（configure_wandb / build_sft_config 的 report_to、run_name） ---
+
+
+def _train_args(**overrides):
+    """造帶齊欄位的 Namespace（對應 parse_args 預設），供 build_sft_config/configure_wandb 用。"""
+    base = dict(
+        smoke=False, epochs=None, batch_size=None, grad_accum=None,
+        max_length=None, output_dir=None, no_weighted=False,
+        extended_targets=False, no_wandb=False,
+    )
+    base.update(overrides)
+    return argparse.Namespace(**base)
+
+
+def _build_or_skip(args):
+    """建 SFTConfig；若此環境（如無 GPU/bf16 支援）無法建構則 skip 而非 fail。"""
+    try:
+        return build_sft_config(args)
+    except (ValueError, ImportError, RuntimeError) as exc:  # noqa: BLE001
+        pytest.skip(f"SFTConfig 無法在此環境建構：{exc}")
+
+
+def test_build_sft_config_reports_to_wandb_by_default():
+    # Act
+    cfg = _build_or_skip(_train_args())
+    # Assert：預設只上報 wandb、專案名正確、run 名以 qlora-cyber- 開頭
+    assert cfg.report_to == ["wandb"]
+    assert cfg.project == config.WANDB_PROJECT
+    assert cfg.run_name.startswith("qlora-cyber-")
+
+
+def test_build_sft_config_no_wandb_disables_reporting():
+    # Act
+    cfg = _build_or_skip(_train_args(no_wandb=True))
+    # Assert：--no-wandb 時不上報任何後端
+    assert cfg.report_to == []
+
+
+def test_build_sft_config_smoke_uses_smoke_run_name():
+    # Act
+    cfg = _build_or_skip(_train_args(smoke=True))
+    # Assert：煙霧測試 run 名以 smoke- 開頭，與正式訓練區隔
+    assert cfg.run_name.startswith("smoke-")
+
+
+def test_configure_wandb_sets_nonsecret_defaults(monkeypatch):
+    # Arrange：隔離環境變數、停用真實 .env 載入；提供金鑰使其通過 fail-fast
+    import os
+
+    monkeypatch.setattr("dotenv.load_dotenv", lambda *a, **k: False)
+    monkeypatch.setattr(os, "environ", {"WANDB_API_KEY": "dummy"})
+    # Act
+    configure_wandb(_train_args())
+    # Assert：非機密預設被 setdefault 補上
+    assert os.environ["WANDB_PROJECT"] == config.WANDB_PROJECT
+    assert os.environ["WANDB_BASE_URL"] == config.WANDB_BASE_URL
+
+
+def test_configure_wandb_missing_key_exits(monkeypatch):
+    # Arrange：無金鑰、停用 .env 載入
+    import os
+
+    monkeypatch.setattr("dotenv.load_dotenv", lambda *a, **k: False)
+    monkeypatch.setattr(os, "environ", {})
+    # Act / Assert：缺 WANDB_API_KEY 時 fail fast，不進入訓練
+    with pytest.raises(SystemExit, match="WANDB_API_KEY"):
+        configure_wandb(_train_args())
+
+
+def test_configure_wandb_no_wandb_skips_setup(monkeypatch):
+    # Arrange
+    import os
+
+    monkeypatch.setattr(os, "environ", {})
+    # Act：--no-wandb 應直接略過，不檢查金鑰、不設環境變數
+    configure_wandb(_train_args(no_wandb=True))
+    # Assert
+    assert "WANDB_PROJECT" not in os.environ

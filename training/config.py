@@ -25,7 +25,7 @@ SAMPLER_WEIGHTS_PATH = PROCESSED_DIR / "sampler_weights.json"
 TRAIN_TEMPLATE_PATH = TRAINING_DIR / "qwen35_train_template.jinja"
 # 輸出
 OUTPUT_DIR = REPO_ROOT / "outputs" / "qlora-cyber"
-RUN_DIR = OUTPUT_DIR / "run"  # 正式訓練輸出（checkpoints + tensorboard log）
+RUN_DIR = OUTPUT_DIR / "run"  # 正式訓練輸出（checkpoints；訓練指標上報 wandb）
 ADAPTER_DIR = RUN_DIR / "final-adapter"  # 訓練結束的最終 LoRA adapter（= merge 的預設輸入）
 MERGED_DIR = REPO_ROOT / "outputs" / "qlora-cyber-merged"  # merge 後的完整 bf16 權重
 
@@ -98,6 +98,12 @@ EVAL_STEPS = 500
 SAVE_STEPS = 500
 SAVE_TOTAL_LIMIT = 3
 SEED = 42
+
+# --- 監控（Weights & Biases；self-hosted Docker） ---
+# 非機密預設集中於此；WANDB_API_KEY 為機密，僅由 .env / 環境變數提供（見 .env.example）。
+REPORT_TO = ["wandb"]  # 監控上報目標（停用 tensorboard）
+WANDB_PROJECT = "cyber-finetuning"
+WANDB_BASE_URL = "http://localhost:8081"  # Docker 自架 wandb server（非機密，可改）
 
 # --- 煙霧測試（--smoke）：極小子集 + 少步，快速驗證整條訓練路徑能跑通 ---
 SMOKE_SUBSET = 64

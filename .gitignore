@@ -12,6 +12,14 @@
 # Training outputs (LoRA adapters, checkpoints, merged models)
 /outputs/
 
+# wandb 本地 run 暫存／log（訓練時自動產生；指標已上報 server）
+/wandb/
+
 # Python bytecode caches
 __pycache__/
 *.pyc
+
+# Local env / secrets（.env 含 WANDB_API_KEY，絕不進版控）
+.env
+.env.*
+!.env.example

@@ -29,14 +29,38 @@ def parse_args(argv=None) -> argparse.Namespace:
                     help="關閉 per-source 加權取樣（除錯/對比用）")
     ap.add_argument("--extended-targets", action="store_true",
                     help="LoRA 額外納入 30 層 linear_attn 投影（進階實驗）")
+    ap.add_argument("--no-wandb", action="store_true",
+                    help="關閉 wandb 上報（離線/除錯；report_to=[]，不需 WANDB_API_KEY）")
     return ap.parse_args(argv)
+
+
+def configure_wandb(args: argparse.Namespace) -> None:
+    """載入 .env 並設定 wandb 環境變數（self-hosted）。--no-wandb 時直接略過。"""
+    if args.no_wandb:
+        return
+    import os
+
+    from dotenv import load_dotenv
+
+    load_dotenv()  # override=False：優先序 shell env > .env > config 預設
+    os.environ.setdefault("WANDB_PROJECT", config.WANDB_PROJECT)
+    os.environ.setdefault("WANDB_BASE_URL", config.WANDB_BASE_URL)
+    os.environ.setdefault("WANDB_LOG_MODEL", "false")  # 不把 checkpoint 當 artifact 上傳
+    if not os.environ.get("WANDB_API_KEY"):
+        raise SystemExit(
+            "缺 WANDB_API_KEY：請把 .env.example 複製成 .env 並填入金鑰"
+            f"（從 {config.WANDB_BASE_URL}/authorize 取得），或用 --no-wandb 關閉上報。"
+        )
 
 
 def build_sft_config(args: argparse.Namespace):
     """從 config 常數 + CLI 覆寫組 SFTConfig。"""
+    from datetime import datetime
+
     from trl import SFTConfig
 
     smoke = args.smoke
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     default_dir = config.OUTPUT_DIR / "smoke" if smoke else config.RUN_DIR
     output_dir = args.output_dir or str(default_dir)
     kw = dict(
@@ -61,7 +85,8 @@ def build_sft_config(args: argparse.Namespace):
         eval_strategy="steps",
         save_strategy="steps",
         save_total_limit=config.SAVE_TOTAL_LIMIT,
-        report_to=["tensorboard"],
+        report_to=([] if args.no_wandb else config.REPORT_TO),
+        project=config.WANDB_PROJECT,  # 明確指定 wandb 專案，避免被 SFTConfig 預設 'huggingface' 蓋過
         seed=config.SEED,
     )
     if smoke:
@@ -73,22 +98,26 @@ def build_sft_config(args: argparse.Namespace):
             save_steps=config.SMOKE_SAVE_STEPS,
             dataloader_num_workers=0,
             load_best_model_at_end=False,
+            run_name=f"smoke-{ts}",
         )
     else:
+        epochs = args.epochs or config.NUM_TRAIN_EPOCHS
         kw.update(
-            num_train_epochs=args.epochs or config.NUM_TRAIN_EPOCHS,
+            num_train_epochs=epochs,
             logging_steps=config.LOGGING_STEPS,
             eval_steps=config.EVAL_STEPS,
             save_steps=config.SAVE_STEPS,
             dataloader_num_workers=4,
             load_best_model_at_end=True,
             metric_for_best_model="eval_loss",
+            run_name=f"qlora-cyber-{epochs}ep-{ts}",
         )
     return SFTConfig(**kw)
 
 
 def main(argv=None):
     args = parse_args(argv)
+    configure_wandb(args)  # 載入 .env + 設定 wandb 環境變數（須在 trainer.train() 前）
 
     from .data import build_example_weights, load_sampler_weights, load_sft_datasets
     from .lora_loader import (
