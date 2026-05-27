@@ -8,3 +8,10 @@
 
 # Model weights & caches (large binary artifacts, e.g. *.gguf)
 /models/
+
+# Training outputs (LoRA adapters, checkpoints, merged models)
+/outputs/
+
+# Python bytecode caches
+__pycache__/
+*.pyc

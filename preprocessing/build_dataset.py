@@ -30,7 +30,14 @@ from .loaders import (
     load_primus_reasoning,
     load_triplet,
 )
-from .quality import cjk_char_ratio, count_record_tokens, exact_dedup, validate_record
+from .quality import (
+    cjk_char_ratio,
+    count_assistant_tokens,
+    count_record_tokens,
+    exact_dedup,
+    is_offtopic,
+    validate_record,
+)
 from .split import stratified_split
 
 # 任一 message 的 CJK 佔比超過此值即視為含中文（語言分佈統計用）。
@@ -79,6 +86,33 @@ def _collect_records(no_system: bool) -> list[dict]:
     return records
 
 
+def _source_excluded(source: str, patterns: set[str]) -> bool:
+    """source 精確等於某 pattern，或以 pattern + "/" 或 "-" 為邊界即視為被排除。
+
+    "/" 邊界覆蓋 primus/<x> 命名空間；"-" 覆蓋 primus/reasoning-<variant>。
+    精確型 pattern（如 "trendyol"）因此不會誤殺手足；"attack" 也不會誤殺 "attackqa"。
+    """
+    for p in patterns:
+        if source == p or source.startswith(p + "/") or source.startswith(p + "-"):
+            return True
+    return False
+
+
+def _resolve_excludes(args) -> set[str]:
+    """解析最終排除 pattern 集合。
+
+    --exclude-sources 給定即「取代」預設並優先（給空清單＝不排除任何來源）；
+    未給定時：--no-default-excludes 為空集，否則用 config.DEFAULT_EXCLUDED_SOURCES。
+    """
+    if args.exclude_sources is not None:
+        base: tuple[str, ...] = tuple(args.exclude_sources)
+    elif args.no_default_excludes:
+        base = ()
+    else:
+        base = config.DEFAULT_EXCLUDED_SOURCES
+    return {p for p in base if p}
+
+
 def _write_jsonl(path: Path, records: list[dict]) -> None:
     """寫 JSONL；剔除底線開頭的內部欄位（如 _tokens）。"""
     with open(path, "w", encoding="utf-8") as f:
@@ -89,13 +123,20 @@ def _write_jsonl(path: Path, records: list[dict]) -> None:
 
 def _build_stats(records: list[dict], raw_total: int, dropped: Counter, args) -> dict:
     tokens = sorted(r.get("_tokens", 0) for r in records)
-    per_source = Counter(r["source"] for r in records)
-    per_category = Counter(r.get("category") for r in records)
-    with_cjk = sum(
-        1
-        for r in records
-        if any(cjk_char_ratio(m["content"]) > _CJK_FLAG_RATIO for m in r["messages"])
-    )
+    per_source: Counter = Counter()
+    per_category: Counter = Counter()
+    assistant_tok_by_source: defaultdict = defaultdict(int)
+    total_tok_by_source: defaultdict = defaultdict(int)
+    with_cjk = 0
+    for r in records:
+        source = r["source"]
+        per_source[source] += 1
+        per_category[r.get("category")] += 1
+        assistant_tok_by_source[source] += r.get("_assistant_tokens", 0)
+        total_tok_by_source[source] += r.get("_tokens", 0)
+        if any(cjk_char_ratio(m["content"]) > _CJK_FLAG_RATIO for m in r["messages"]):
+            with_cjk += 1
+    ordered_sources = [s for s, _ in per_source.most_common()]
     return {
         "raw_total": raw_total,
         "kept_total": len(records),
@@ -112,6 +153,9 @@ def _build_stats(records: list[dict], raw_total: int, dropped: Counter, args) ->
         "records_with_cjk": with_cjk,
         "per_source": dict(per_source.most_common()),
         "per_category": dict(per_category.most_common()),
+        # 加權重算用：每來源樣本數 vs assistant-token 量（答案長度差異大時兩者佔比不同）。
+        "assistant_tokens_per_source": {s: assistant_tok_by_source[s] for s in ordered_sources},
+        "total_tokens_per_source": {s: total_tok_by_source[s] for s in ordered_sources},
     }
 
 
@@ -122,6 +166,8 @@ def _print_summary(stats: dict) -> None:
     print(f"原始筆數：{stats['raw_total']}")
     print(f"保留筆數：{stats['kept_total']}")
     print(f"丟棄：{stats['dropped']}")
+    if stats.get("excluded_sources"):
+        print(f"排除來源：{stats['excluded_sources']}")
     print(f"長度上限：{stats['max_total_tokens']} tok（計數：{stats['token_counter']}）")
     tl = stats["token_length"]
     print(f"長度分佈：p50={tl['p50']} p95={tl['p95']} p99={tl['p99']} max={tl['max']}")
@@ -136,7 +182,32 @@ def build(args) -> None:
     dropped: Counter = Counter()
 
     records = _collect_records(args.no_system)
-    raw_total = len(records)
+    raw_total = len(records)  # provenance：全部 collect 數（含被排除來源）
+
+    # 0a) 來源排除（預設排除 Trendyol；置於 tokenizer 前以省算力）
+    excluded_patterns = _resolve_excludes(args)
+    excluded_by_source: Counter = Counter()
+    if excluded_patterns:
+        kept: list[dict] = []
+        for record in records:
+            if _source_excluded(record["source"], excluded_patterns):
+                excluded_by_source[record["source"]] += 1
+                continue
+            kept.append(record)
+        records = kept
+        dropped["excluded_source"] = sum(excluded_by_source.values())
+
+    # 0b) 離題過濾（opt-in，僅作用於 config.OFFTOPIC_FILTER_SOURCES）
+    if args.drop_offtopic:
+        kept = []
+        n_off = 0
+        for record in records:
+            if record["source"] in config.OFFTOPIC_FILTER_SOURCES and is_offtopic(record):
+                n_off += 1
+                continue
+            kept.append(record)
+        records = kept
+        dropped["offtopic"] = n_off
 
     # 1) 結構驗證
     valid: list[dict] = []
@@ -146,11 +217,12 @@ def build(args) -> None:
             continue
         valid.append(record)
 
-    # 2) 長度過濾（順便把估算長度暫存到 _tokens 供統計用）
+    # 2) 長度過濾（順便把估算長度暫存到 _tokens / _assistant_tokens 供統計用）
     length_kept: list[dict] = []
     for record in valid:
         n_tokens = count_record_tokens(record, counter)
         record["_tokens"] = n_tokens
+        record["_assistant_tokens"] = count_assistant_tokens(record, counter)
         if n_tokens > args.max_total_tokens:
             dropped["too_long"] += 1
             continue
@@ -161,6 +233,9 @@ def build(args) -> None:
     dropped["duplicate"] = n_dup
 
     stats = _build_stats(deduped, raw_total, dropped, args)
+    if excluded_patterns:
+        stats["excluded_source_patterns"] = sorted(excluded_patterns)
+        stats["excluded_sources"] = dict(excluded_by_source.most_common())
 
     if args.dry_run:
         _print_summary(stats)
@@ -175,6 +250,12 @@ def build(args) -> None:
     by_source: dict = defaultdict(list)
     for record in deduped:
         by_source[record["source"]].append(record)
+    new_files = {source.replace("/", "_") + ".jsonl" for source in by_source}
+    # 清掉前次建構殘留、本次不再產出的來源檔（如已排除的 trendyol.jsonl），
+    # 否則 audit_quality.py（glob *.jsonl）會誤讀過期檔。
+    for stale in sources_dir.glob("*.jsonl"):
+        if stale.name not in new_files:
+            stale.unlink()
     for source, recs in by_source.items():
         filename = source.replace("/", "_") + ".jsonl"
         _write_jsonl(sources_dir / filename, recs)
@@ -207,6 +288,24 @@ def main(argv: Optional[list[str]] = None) -> None:
     )
     parser.add_argument(
         "--no-system", action="store_true", help="不注入 system prompt"
+    )
+    parser.add_argument(
+        "--exclude-sources",
+        nargs="*",
+        default=None,
+        metavar="PATTERN",
+        help="排除的來源（精確或前綴，如 trendyol primus/reasoning）；"
+        "給定即取代 config.DEFAULT_EXCLUDED_SOURCES。",
+    )
+    parser.add_argument(
+        "--no-default-excludes",
+        action="store_true",
+        help="不套用 config 預設排除（含 Trendyol），用於重現舊版做對照。",
+    )
+    parser.add_argument(
+        "--drop-offtopic",
+        action="store_true",
+        help="剔除 primus/general 中無資安關鍵字的離題樣本（粗略、opt-in）。",
     )
     parser.add_argument(
         "--hf-tokenizer",

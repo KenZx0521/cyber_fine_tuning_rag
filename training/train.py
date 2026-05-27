@@ -1,0 +1,146 @@
+"""QLoRA 訓練進入點。
+
+  正式訓練：   uv run python -m training.train
+  煙霧測試：   uv run python -m training.train --smoke
+  自訂：       uv run python -m training.train --batch-size 4 --max-length 3072
+
+組裝流程：4-bit 量化載入 + LoRA → 載入資料 + per-source 加權 → WeightedSFTTrainer → 訓練 → 存 adapter。
+情境（已拍板）：3 epochs + α=0.5，沿用既有 sampler_weights.json。
+"""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+from . import config
+
+
+def parse_args(argv=None) -> argparse.Namespace:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--smoke", action="store_true",
+                    help="煙霧測試：極小子集 + 少步，快速驗證整條訓練路徑能跑通")
+    ap.add_argument("--epochs", type=int, default=None, help="覆寫 num_train_epochs")
+    ap.add_argument("--batch-size", type=int, default=None, help="覆寫 per_device_train_batch_size")
+    ap.add_argument("--grad-accum", type=int, default=None, help="覆寫 gradient_accumulation_steps")
+    ap.add_argument("--max-length", type=int, default=None, help="覆寫 max_length（截斷上限）")
+    ap.add_argument("--output-dir", default=None, help="覆寫輸出目錄")
+    ap.add_argument("--no-weighted", action="store_true",
+                    help="關閉 per-source 加權取樣（除錯/對比用）")
+    ap.add_argument("--extended-targets", action="store_true",
+                    help="LoRA 額外納入 30 層 linear_attn 投影（進階實驗）")
+    return ap.parse_args(argv)
+
+
+def build_sft_config(args: argparse.Namespace):
+    """從 config 常數 + CLI 覆寫組 SFTConfig。"""
+    from trl import SFTConfig
+
+    smoke = args.smoke
+    default_dir = config.OUTPUT_DIR / "smoke" if smoke else config.RUN_DIR
+    output_dir = args.output_dir or str(default_dir)
+    kw = dict(
+        output_dir=output_dir,
+        bf16=True,
+        per_device_train_batch_size=args.batch_size or (1 if smoke else config.PER_DEVICE_TRAIN_BATCH_SIZE),
+        gradient_accumulation_steps=args.grad_accum or (1 if smoke else config.GRADIENT_ACCUMULATION_STEPS),
+        per_device_eval_batch_size=config.PER_DEVICE_EVAL_BATCH_SIZE,
+        learning_rate=config.LEARNING_RATE,
+        lr_scheduler_type=config.LR_SCHEDULER_TYPE,
+        warmup_ratio=config.WARMUP_RATIO,
+        weight_decay=config.WEIGHT_DECAY,
+        max_grad_norm=config.MAX_GRAD_NORM,
+        # grad ckpt 在 prepare_model_for_kbit_training 與此處一致設定（use_reentrant=False，冪等）。
+        gradient_checkpointing=config.GRADIENT_CHECKPOINTING,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
+        max_length=args.max_length or config.MAX_LENGTH,
+        packing=False,  # 破壞 per-example 權重語意與多輪 mask 邊界，故不採用
+        shuffle_dataset=False,  # 隨機性交給 WeightedRandomSampler，避免雙重 shuffle
+        assistant_only_loss=True,  # 只在 assistant token 算 loss（依訓練模板的 {% generation %}）
+        optim=config.OPTIM,
+        eval_strategy="steps",
+        save_strategy="steps",
+        save_total_limit=config.SAVE_TOTAL_LIMIT,
+        report_to=["tensorboard"],
+        seed=config.SEED,
+    )
+    if smoke:
+        kw.update(
+            max_steps=config.SMOKE_MAX_STEPS,
+            num_train_epochs=1,
+            logging_steps=1,
+            eval_steps=config.SMOKE_SAVE_STEPS,
+            save_steps=config.SMOKE_SAVE_STEPS,
+            dataloader_num_workers=0,
+            load_best_model_at_end=False,
+        )
+    else:
+        kw.update(
+            num_train_epochs=args.epochs or config.NUM_TRAIN_EPOCHS,
+            logging_steps=config.LOGGING_STEPS,
+            eval_steps=config.EVAL_STEPS,
+            save_steps=config.SAVE_STEPS,
+            dataloader_num_workers=4,
+            load_best_model_at_end=True,
+            metric_for_best_model="eval_loss",
+        )
+    return SFTConfig(**kw)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+
+    from .data import build_example_weights, load_sampler_weights, load_sft_datasets
+    from .lora_loader import (
+        assert_only_lora_trainable,
+        load_lora_model_and_processor,
+        report_model,
+    )
+    from .weighted_trainer import WeightedSFTTrainer
+
+    target_modules = config.TARGET_MODULES_WITH_LINEAR_ATTN if args.extended_targets else None
+    print(">> 載入 bf16 模型並掛 LoRA …")
+    model, processor = load_lora_model_and_processor(target_modules=target_modules)
+    report_model(model)
+    assert_only_lora_trainable(model)
+
+    # 純文字 SFT 走 tokenizer（assistant_only_loss 依賴 tokenizer.apply_chat_template
+    # 的 return_assistant_tokens_mask）。設自訂訓練模板（含 {% generation %} 標記）。
+    tokenizer = getattr(processor, "tokenizer", processor)
+    tokenizer.chat_template = config.TRAIN_TEMPLATE_PATH.read_text(encoding="utf-8")
+
+    print(">> 載入資料 …")
+    train_ds, val_ds = load_sft_datasets()
+    if args.smoke:
+        train_ds = train_ds.select(range(min(config.SMOKE_SUBSET, len(train_ds))))
+        val_ds = val_ds.select(range(min(config.SMOKE_SUBSET, len(val_ds))))
+    print(f"   train={len(train_ds)}  val={len(val_ds)}")
+
+    example_weights = None
+    if not args.no_weighted:
+        weights_map = load_sampler_weights()
+        example_weights = build_example_weights(train_ds["source"], weights_map)
+        print(f"   已套 per-source 加權取樣（{len(weights_map)} 來源）")
+
+    sft_config = build_sft_config(args)
+    trainer = WeightedSFTTrainer(
+        model=model,
+        args=sft_config,
+        train_dataset=train_ds,
+        eval_dataset=val_ds,
+        processing_class=tokenizer,
+        example_weights=example_weights,
+    )
+
+    print(">> 開始訓練 …")
+    trainer.train()
+
+    final_dir = Path(sft_config.output_dir) / "final-adapter"
+    trainer.save_model(str(final_dir))
+    tokenizer.save_pretrained(str(final_dir))
+    print(f">> 完成。adapter 已存：{final_dir}")
+    return trainer
+
+
+if __name__ == "__main__":
+    main()

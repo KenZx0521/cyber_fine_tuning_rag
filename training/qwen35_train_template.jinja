@@ -1,0 +1,49 @@
+{#- 訓練用 chat template（cyber_fine_tuning / qwen3_5_moe）。
+
+     與模型原生模板的差異：加入 {% generation %} 標記包住 assistant 的可學習內容，
+     讓 tokenizer.apply_chat_template(return_assistant_tokens_mask=True) 能產生
+     assistant token mask，供 TRL assistant_only_loss 只在 assistant token 上算 loss。
+
+     保留原生模板的 think 處理（與推理時格式一致，避免 train/inference 不匹配）：
+       - 從 assistant content 自動拆出內嵌的 <think>…</think>
+       - 僅「最後一個 user query 之後」的 assistant 才渲染 think（含空 think），
+         歷史輪的 think 移除（與原生 ns.last_query_index 行為一致）
+     generation 範圍 = think + 最終答案 + <|im_end|>（不含 <|im_start|>assistant\n 前綴
+     與結尾換行）。僅處理純文字 system/user/assistant（訓練資料無 tool/vision）。 #}
+{%- if messages[0].role == 'system' %}
+    {{- '<|im_start|>system\n' + messages[0].content + '<|im_end|>\n' }}
+    {%- set loop_messages = messages[1:] %}
+{%- else %}
+    {%- set loop_messages = messages %}
+{%- endif %}
+{%- set ns = namespace(last_query_index = -1) %}
+{%- for message in loop_messages %}
+    {%- if message.role == 'user' %}
+        {%- set ns.last_query_index = loop.index0 %}
+    {%- endif %}
+{%- endfor %}
+{%- for message in loop_messages %}
+    {%- if message.role == 'user' %}
+        {{- '<|im_start|>user\n' + message.content + '<|im_end|>\n' }}
+    {%- elif message.role == 'assistant' %}
+        {%- set content = message.content %}
+        {%- set reasoning_content = '' %}
+        {%- if '</think>' in content %}
+            {%- set reasoning_content = content.split('</think>')[0].rstrip('\n').split('<think>')[-1].lstrip('\n') %}
+            {%- set content = content.split('</think>')[-1].lstrip('\n') %}
+        {%- endif %}
+        {%- set reasoning_content = reasoning_content | trim %}
+        {{- '<|im_start|>assistant\n' }}
+        {%- generation %}
+        {%- if loop.index0 > ns.last_query_index %}
+            {{- '<think>\n' + reasoning_content + '\n</think>\n\n' + content + '<|im_end|>' }}
+        {%- else %}
+            {{- content + '<|im_end|>' }}
+        {%- endif %}
+        {%- endgeneration %}
+        {{- '\n' }}
+    {%- endif %}
+{%- endfor %}
+{%- if add_generation_prompt %}
+    {{- '<|im_start|>assistant\n<think>\n' }}
+{%- endif %}

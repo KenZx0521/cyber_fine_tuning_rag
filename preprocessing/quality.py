@@ -29,6 +29,21 @@ def count_record_tokens(
     return sum(counter(m["content"]) for m in messages)
 
 
+def count_assistant_tokens(
+    record: dict,
+    counter: Optional[Callable[[str], int]] = None,
+) -> int:
+    """只計 assistant turn 的 token 數（加權所需的學習訊號量）；counter 為 None 時用 heuristic。"""
+    contents = [
+        m["content"]
+        for m in record.get("messages", [])
+        if m.get("role") == "assistant"
+    ]
+    if counter is None:
+        return sum(estimate_tokens(c) for c in contents)
+    return sum(counter(c) for c in contents)
+
+
 def validate_record(record: dict) -> list[str]:
     """檢查單筆 record 結構；回傳錯誤原因清單（空清單代表通過）。"""
     errors: list[str] = []
@@ -68,6 +83,20 @@ def validate_record(record: dict) -> list[str]:
 
 def is_valid(record: dict) -> bool:
     return not validate_record(record)
+
+
+def is_offtopic(record: dict, pattern=config.CYBER_HINT) -> bool:
+    """user/assistant 內容皆無資安關鍵字即視為離題（system 不納入掃描）。
+
+    system 一律含 "cybersecurity"，掃進去會永遠判定非離題，故只看 user+assistant。
+    粗略、有假陽性，僅應對 config.OFFTOPIC_FILTER_SOURCES 列出的來源使用。
+    """
+    text = " ".join(
+        m["content"]
+        for m in record.get("messages", [])
+        if m.get("role") != "system"
+    )
+    return not pattern.search(text)
 
 
 def exact_dedup(records: Iterable[dict]) -> tuple[list[dict], int]:

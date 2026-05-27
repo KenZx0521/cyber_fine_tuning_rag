@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 # --- 路徑（皆相對於 repo root 推導，不寫死絕對路徑） ---
@@ -54,3 +55,26 @@ DEFAULT_VAL_SIZE = 0.02
 DEFAULT_SEED = 42
 
 VALID_ROLES = ("system", "user", "assistant")
+
+# --- 來源排除 ---
+# 預設排除：Trendyol 經 md5 全文比對為 Fenrir 的嚴格子集（100% 重複），
+# 排除即零損失去冗餘。比對採「精確或前綴」，見 build_dataset._source_excluded。
+DEFAULT_EXCLUDED_SOURCES: tuple[str, ...] = ("trendyol",)
+# CTIBench 污染來源前綴（primus/reasoning-o1, primus/reasoning-deepseek-r1）。
+# 預設「不」排除（保留 reasoning 訓練）；要保 CTIBench 當乾淨 eval 時，
+# 可用 --exclude-sources primus/reasoning 切換。
+REASONING_SOURCE_PREFIX = "primus/reasoning"
+
+# --- 離題偵測 / 過濾 ---
+# 資安關鍵字（粗略、有假陽性）。此 pattern 與 audit_quality.CYBER_HINT 同步，
+# auditor 為 stdlib-only standalone 故各保留一份；以 test 守住兩者一致。
+CYBER_HINT_PATTERN = (
+    r"(secur|attack|threat|vulnerab|malware|cyber|exploit|cve|cwe|mitre|att&ck|"
+    r"ransom|phish|firewall|encrypt|crypto|siem|\bsoc\b|incident|defen|payload|"
+    r"injection|backdoor|privilege|reconnaiss|c2\b|command and control|"
+    r"安全|漏洞|攻击|威胁|加密|防御)"
+)
+CYBER_HINT = re.compile(CYBER_HINT_PATTERN, re.I)
+# 僅對這些來源套用離題過濾（--drop-offtopic）。primus/general 含刻意保留的
+# 通用助理任務；其餘 primus 子任務的關鍵字偵測假陽性高，故不納入。
+OFFTOPIC_FILTER_SOURCES: tuple[str, ...] = ("primus/general",)
