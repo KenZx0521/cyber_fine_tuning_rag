@@ -13,7 +13,10 @@ import pytest
 from training import config
 from training.data import build_example_weights, load_sampler_weights
 from training.train import build_sft_config, configure_wandb
-from training.weighted_trainer import make_weighted_sampler
+from training.weighted_trainer import (
+    make_weighted_sampler,
+    weighted_length_grouped_indices,
+)
 
 
 # --- build_example_weights（per-source 倍率 → per-example 權重） ---
@@ -78,6 +81,50 @@ def test_make_weighted_sampler_upsamples_high_weight_source():
     draws = list(make_weighted_sampler(weights, 10))
     # Assert：高權重 index 應佔絕大多數（驗證加權方向正確）
     assert draws.count(0) >= 7
+
+
+# --- weighted_length_grouped_indices（加權抽樣 + 長度分組重排） ---
+
+
+def test_weighted_length_grouped_preserves_upsampling():
+    # Arrange：index 0 權重極高 → 分組重排後仍應主導（驗證加權方向未被破壞）
+    import torch
+
+    torch.manual_seed(0)
+    weights = [100.0] + [0.01] * 9
+    lengths = list(range(10))
+    # Act
+    out = weighted_length_grouped_indices(
+        weights, lengths, batch_size=2, num_samples=10, mega_batch_mult=50
+    )
+    # Assert：步數不變、高權重 index 仍佔絕大多數
+    assert len(out) == 10
+    assert out.count(0) >= 7
+
+
+def test_weighted_length_grouped_sorts_within_megabatch():
+    # Arrange：均一權重、長度打散；單一 mega-batch 內應依長度降序（padding 分組生效）
+    import torch
+
+    n = 20
+    weights = [1.0] * n
+    lengths = [(i * 7) % 20 for i in range(n)]
+    torch.manual_seed(0)
+    # Act：mega_batch_mult 夠大 → 全部落在一個 mega-batch
+    out = weighted_length_grouped_indices(
+        weights, lengths, batch_size=2, num_samples=n, mega_batch_mult=n
+    )
+    # Assert：取出的長度序列為降序（含 replacement 重複亦成立）
+    out_lengths = [lengths[i] for i in out]
+    assert out_lengths == sorted(out_lengths, reverse=True)
+
+
+def test_weighted_length_grouped_raises_on_length_mismatch():
+    # Act / Assert：weights 與 lengths 長度錯位時 fail fast
+    with pytest.raises(ValueError, match="長度"):
+        weighted_length_grouped_indices(
+            [1.0, 2.0], [1, 2, 3], batch_size=2, num_samples=2
+        )
 
 
 # --- 訓練模板 assistant-only mask（需 tokenizer；無法載入則 skip） ---

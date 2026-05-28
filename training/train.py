@@ -4,14 +4,20 @@
   煙霧測試：   uv run python -m training.train --smoke
   自訂：       uv run python -m training.train --batch-size 4 --max-length 3072
 
-組裝流程：4-bit 量化載入 + LoRA → 載入資料 + per-source 加權 → WeightedSFTTrainer → 訓練 → 存 adapter。
-情境（已拍板）：3 epochs + α=0.5，沿用既有 sampler_weights.json。
+組裝流程：bf16 載入 + LoRA → 載入資料 + per-source 加權（長度分組）→ WeightedSFTTrainer → 訓練 → 存 adapter。
+情境（已拍板）：2 epochs + α=0.5 / cap=3（primus/general 權重=0 排除取樣），沿用既有 sampler_weights.json。
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
+
+# bs=3 峰值 VRAM 貼近 95GiB 上限；expandable_segments 減少碎片化以避免 OOM。
+# 須在 torch 初始化 CUDA 前設定（torch 於各函式內延遲 import，故此處 module-load 即生效）。
+# 已用環境變數設定者優先（setdefault 不覆寫）。
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 from . import config
 
@@ -66,6 +72,8 @@ def build_sft_config(args: argparse.Namespace):
     kw = dict(
         output_dir=output_dir,
         bf16=True,
+        bf16_full_eval=True,  # eval 也走 bf16（不 upcast fp32），更快更省 VRAM
+        prediction_loss_only=True,  # eval 只需 eval_loss；不累積 248k-vocab logits（防 OOM、加速）
         per_device_train_batch_size=args.batch_size or (1 if smoke else config.PER_DEVICE_TRAIN_BATCH_SIZE),
         gradient_accumulation_steps=args.grad_accum or (1 if smoke else config.GRADIENT_ACCUMULATION_STEPS),
         per_device_eval_batch_size=config.PER_DEVICE_EVAL_BATCH_SIZE,
@@ -107,7 +115,10 @@ def build_sft_config(args: argparse.Namespace):
             logging_steps=config.LOGGING_STEPS,
             eval_steps=config.EVAL_STEPS,
             save_steps=config.SAVE_STEPS,
-            dataloader_num_workers=4,
+            # num_workers=0：資料已預先 tokenize，取批僅需索引+padding（極輕）。用 worker 子進程會在
+            # 「CUDA 已初始化後 fork」觸發不確定性的 dataloader 死鎖（實測 step 0 卡死 15 分、4 個 worker
+            # 活著卻不產 batch）；單進程載入對此 GPU-bound（~5s/step）工作吞吐影響 <5%，換取穩定。
+            dataloader_num_workers=0,
             load_best_model_at_end=True,
             metric_for_best_model="eval_loss",
             run_name=f"qlora-cyber-{epochs}ep-{ts}",
@@ -159,6 +170,8 @@ def main(argv=None):
         eval_dataset=val_ds,
         processing_class=tokenizer,
         example_weights=example_weights,
+        group_by_length=config.GROUP_BY_LENGTH,
+        mega_batch_mult=config.LENGTH_GROUP_MEGA_BATCH_MULT,
     )
 
     print(">> 開始訓練 …")

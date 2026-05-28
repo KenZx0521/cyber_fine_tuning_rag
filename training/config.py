@@ -4,7 +4,8 @@
 刻意不在此 import torch —— 量化的 compute dtype 以字串表示，由 quant_loader
 轉成 torch dtype，讓 config 維持輕量、無重相依。
 
-訓練情境（使用者已拍板）：3 epochs + α=0.5，沿用既有 data/processed/sampler_weights.json。
+訓練情境（使用者已拍板）：2 epochs + α=0.5 / cap=3（已把雜燴的 primus/general 權重設 0 排除取樣），
+沿用既有 data/processed/sampler_weights.json。
 """
 
 from __future__ import annotations
@@ -78,24 +79,41 @@ TARGET_MODULES_WITH_LINEAR_ATTN = TARGET_MODULES + [
 # device_map 全塞單卡（不 offload；訓練時 offload 會災難性變慢）。
 DEVICE_MAP: str | dict = {"": 0}
 
-# --- 訓練超參（情境 1：3 epochs + α=0.5；單卡 RTX PRO 6000 95GiB） ---
-NUM_TRAIN_EPOCHS = 3
-PER_DEVICE_TRAIN_BATCH_SIZE = 2  # 煙霧測實測峰值 VRAM 後可上調
-GRADIENT_ACCUMULATION_STEPS = 8  # 有效 batch = 2×8 = 16
-PER_DEVICE_EVAL_BATCH_SIZE = 1  # 量化模型 eval 防 OOM
-LEARNING_RATE = 2e-4  # QLoRA 慣用 1e-4 ~ 2e-4
+# --- 訓練超參（情境：2 epochs + α=0.5 / cap=3；單卡 RTX PRO 6000 95GiB） ---
+# 加速調整（2026-05-28）：本模型為 A3B 稀疏 MoE，吞吐量取決於「每次 forward 餵給 expert 的
+# token 數」。原 bs=2 嚴重餵不飽 256 個 expert（每 expert 僅 ~38 token、GEMM 受記憶體頻寬限制）。
+# 故 bs 2→3（grad_accum 8→5），並啟用長度分組取樣砍 padding 浪費。
+# bs=4 實測 OOM：248k-vocab 的 logits（compute_loss 的 shift_logits.contiguous）在最長 batch
+# (4×2048) 需 ~7.6GiB 連續記憶體；每增 1 bs 約 ~8GiB，weights 固定 65GiB → bs=4 峰值 ~98GiB 超出
+# 95GiB；bs=3 峰值 ~90GiB 可容（留 ~5GiB）。搭 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True 減碎片。
+NUM_TRAIN_EPOCHS = 2
+PER_DEVICE_TRAIN_BATCH_SIZE = 3  # MoE expert GEMM 餵料↑50%；bs=4 因 logits 連續複製 OOM
+GRADIENT_ACCUMULATION_STEPS = 5  # 有效 batch = 3×5 = 15（≈ 原 16）
+# eval 時訓練 allocator 已保留 ~87GiB（峰值快取不釋放），僅剩 ~7GiB；而 248k-vocab logits 的
+# shift_logits.contiguous() 按 eval_bs 線性放大（實測 bs=8 需 ~10.5GiB → OOM）。bs=2（~2.6GiB）穩妥。
+# 註：prediction_loss_only 只避免「跨 batch 累積預測」，消不掉單 batch 的 logits 峰值，故須小 eval batch。
+PER_DEVICE_EVAL_BATCH_SIZE = 2
+LEARNING_RATE = 2e-4  # 有效 batch 不變，LR 不需調整
 LR_SCHEDULER_TYPE = "cosine"
 WARMUP_RATIO = 0.03
 WEIGHT_DECAY = 0.0  # LoRA adapter 小，通常不用 weight decay
 MAX_GRAD_NORM = 1.0
-# p99=2108、max=7969；2048 涵蓋 p99，記憶體可控。fenrir 偏長，VRAM 有餘可上調至 3072。
+# p50=616、p95=1475、p99=2108、max=7969；2048 涵蓋 p99，記憶體可控。
 MAX_LENGTH = 2048
-OPTIM = "paged_adamw_8bit"  # bnb paged optimizer，省 VRAM、防 OOM spike（G0 已驗證）
-GRADIENT_CHECKPOINTING = True
+# LoRA optimizer state 極小（僅 adapter 參數），不需 paged → 改 fused，移除 CPU↔GPU paging 同步停頓。
+OPTIM = "adamw_torch_fused"
+GRADIENT_CHECKPOINTING = True  # 65GiB 權重下必開（關閉會 OOM）
+
+# --- 長度分組取樣（砍 padding 浪費；與 per-source 加權取樣相容、無品質損失） ---
+# WeightedRandomSampler 隨機配對序列，常把短(p50=616)與長(p99=2108)放同批 → padding 到長者。
+# 改成先按權重抽樣、再把長度相近者排在一起（mega-batch 內排序），dynamic padding 逼近實際長度。
+# 僅重排不改抽樣分佈，per-source 上採樣語意完整保留。
+GROUP_BY_LENGTH = True
+LENGTH_GROUP_MEGA_BATCH_MULT = 50  # mega-batch = batch_size × 此值；越大越隨機、分組效益略降
 
 LOGGING_STEPS = 20
-EVAL_STEPS = 500
-SAVE_STEPS = 500
+EVAL_STEPS = 1000  # eval 較重（eval bs=2 跑全 val ~6.4 分鐘），降頻
+SAVE_STEPS = 1000  # 須為 EVAL_STEPS 的倍數（load_best_model_at_end 要求）
 SAVE_TOTAL_LIMIT = 3
 SEED = 42
 

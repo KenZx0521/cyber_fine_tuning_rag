@@ -47,8 +47,9 @@ uv run python -m preprocessing.build_dataset --drop-offtopic \
   --hf-tokenizer huihui-ai/Huihui-Qwen3.6-35B-A3B-Claude-4.7-Opus-abliterated
 #   → 產出 data/processed/{train,val}.jsonl、stats.json、sources/*.jsonl
 
-# 3. 計算 per-source 取樣權重（α=0.5、cap=5；讀步驟 2 產出的 stats.json）
-uv run python scripts/compute_sampler_weights.py --alpha 0.5 --cap 5 \
+# 3. 計算 per-source 取樣權重（α=0.5、cap=3，並排除雜燴的 primus/general；讀步驟 2 產出的 stats.json）
+uv run python scripts/compute_sampler_weights.py --alpha 0.5 --cap 3 \
+  --exclude-sources primus/general \
   --out data/processed/sampler_weights.json
 ```
 
@@ -90,25 +91,31 @@ uv run python -m training.train --smoke
 uv run python -m training.train
 ```
 
-預設設定（情境：**3 epochs + α=0.5**，完整定義見 [`training/config.py`](training/config.py)）：
+預設設定（情境：**2 epochs + α=0.5 / cap=3**，完整定義見 [`training/config.py`](training/config.py)）：
 
 | 參數 | 值 |
 |---|---|
-| epochs | 3（≈ 22k steps） |
-| 有效 batch | 2 × 8 (gradient accumulation) = 16 |
+| epochs | 2（≈ 15.8k steps） |
+| 有效 batch | 3 × 5 (gradient accumulation) = 15 |
 | learning rate | 2e-4，cosine scheduler，warmup 3% |
-| max_length | 2048（涵蓋 p99；fenrir 偏長可上調） |
+| max_length | 2048（涵蓋 p99） |
 | LoRA | r=16, α=32, dropout 0.05；target = attention + shared_expert FFN |
-| optimizer | paged_adamw_8bit |
-| 加權取樣 | per-source（`sampler_weights.json`：Fenrir 下採樣、小來源上採樣） |
+| optimizer | adamw_torch_fused（LoRA state 小，不需 paged optimizer） |
+| 取樣 | per-source 加權 **+ 長度分組**（砍 padding 浪費；`sampler_weights.json`：Fenrir 下採樣、小來源上採樣） |
+| eval | batch 2、每 1000 步、`prediction_loss_only`（eval 時訓練快取已佔 ~87GiB、僅剩 ~7GiB；248k-vocab logits 按 eval_bs 線性放大，bs≥4 會 OOM） |
+| dataloader | num_workers=0（資料已預 tokenize；num_workers>0 會在 CUDA 初始化後 fork 而不確定性卡死 step 0） |
 
-常用覆寫（載入後尚有 ~28 GiB VRAM 餘裕）：
+> **吞吐**：bs=3 + 長度分組於單卡 RTX PRO 6000 約 ~5 s/step、全程 ~20–24h（比舊 bs=2 / 3ep 的 ~67h 快約 2.7×）。每次 eval（全 val 2424 筆、bs=2）約 6.4 分鐘。VRAM 峰值貼近 95 GiB，故 `train.py` 已預設 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` 減少碎片。
+
+常用覆寫：
 
 ```bash
-uv run python -m training.train --batch-size 4 --grad-accum 4   # 提高吞吐
-uv run python -m training.train --max-length 3072               # 減少 fenrir 長樣本截斷
-uv run python -m training.train --epochs 2                      # 調整 epoch 數
+uv run python -m training.train --epochs 3                      # 回到 3 epochs
+uv run python -m training.train --batch-size 2 --grad-accum 8   # 更保守（若 bs=3 在你的環境 OOM）
+uv run python -m training.train --no-weighted                   # 關閉加權取樣（對比用）
 ```
+
+> ⚠️ **bs=4 會 OOM**：vocab=248,320 的 logits 在最長 batch（4×2048）做 `shift_logits.contiguous()` 需 ~7.6 GiB 連續記憶體，單卡峰值 ~98 GiB 超出 95 GiB；**bs=3**（峰值 ~95 GiB）是已驗證的吞吐上限。
 
 其他選項：`--no-weighted`（關閉加權取樣）、`--extended-targets`（LoRA 額外掛 30 層 linear-attn 投影）、
 `--no-wandb`（關閉 wandb 上報）、`--output-dir <路徑>`（自訂輸出位置）。

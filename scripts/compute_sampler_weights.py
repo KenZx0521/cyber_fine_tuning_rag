@@ -16,7 +16,9 @@
 
 用法：
     python3 scripts/compute_sampler_weights.py --compare
-    python3 scripts/compute_sampler_weights.py --alpha 0.5 --cap 5 \
+    # 本專案 canonical（α=0.5、cap=3，並排除雜燴來源 primus/general）：
+    python3 scripts/compute_sampler_weights.py --alpha 0.5 --cap 3 \
+        --exclude-sources primus/general \
         --out data/processed/sampler_weights.json
 """
 from __future__ import annotations
@@ -55,20 +57,39 @@ def main(argv=None) -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--stats", default="data/processed/stats.json")
     ap.add_argument("--alpha", type=float, default=0.5)
-    ap.add_argument("--cap", type=float, default=5.0, help="重複倍率上限（防小來源過擬合）")
+    ap.add_argument("--cap", type=float, default=3.0,
+                    help="重複倍率上限（防小來源過擬合；cap=3 → 小來源 ×3ep≈9 次曝光）")
     ap.add_argument("--floor", type=float, default=0.0, help="重複倍率下限")
+    ap.add_argument("--exclude-sources", nargs="*", default=[], metavar="SOURCE",
+                    help="完全排除的來源（權重設 0、不納入正規化）；例：--exclude-sources primus/general")
     ap.add_argument("--out", default=None, help="輸出 {source: weight} JSON 路徑")
     ap.add_argument("--compare", action="store_true", help="額外印 alpha 敏感度對照")
     args = ap.parse_args(argv)
 
     stats = json.loads(Path(args.stats).read_text(encoding="utf-8"))
-    tokens = stats["assistant_tokens_per_source"]
-    counts = stats["per_source"]
+    tokens = dict(stats["assistant_tokens_per_source"])
+    counts = dict(stats["per_source"])
+
+    # 完全排除的來源：自 tokens/counts 移除（不納入溫度平滑的正規化），訓練時其權重設 0
+    # → WeightedRandomSampler 永不抽到（等效於移除，但免重建資料集；val 內殘留記錄影響可忽略）。
+    excluded = list(args.exclude_sources)
+    unknown = [s for s in excluded if s not in tokens]
+    if unknown:
+        raise SystemExit(f"--exclude-sources 含未知來源 {unknown}；可用來源：{sorted(tokens)}")
+    for s in excluded:
+        tokens.pop(s)
+        counts.pop(s)
 
     table, weights = compute(tokens, counts, args.alpha, args.cap, args.floor)
+    # 排除來源補回 weight=0（保留 key，避免 build_example_weights 對 train 內殘留記錄 KeyError）。
+    for s in excluded:
+        weights[s] = 0.0
+
     print(f"# weighted-sampler 權重  alpha={args.alpha} cap={args.cap} floor={args.floor}")
     print(f"# 來源={len(table)}  總筆數={sum(counts.values())}  "
           f"總assistant-token={sum(tokens.values())}")
+    if excluded:
+        print(f"# 排除來源（weight=0，未納入正規化）：{', '.join(excluded)}")
     print(f"{'source':42s}{'n':>7}{'orig%':>8}{'調整後%':>9}{'重複x/每筆權重':>16}")
     print("-" * 82)
     for r in table:
