@@ -26,6 +26,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--smoke", action="store_true",
                     help="煙霧測試：極小子集 + 少步，快速驗證整條訓練路徑能跑通")
+    ap.add_argument("--quantize", choices=["4bit", "bf16"], default="4bit",
+                    help="量化策略：4bit=NF4 QLoRA（預設）；bf16=bf16 LoRA fallback")
     ap.add_argument("--epochs", type=int, default=None, help="覆寫 num_train_epochs")
     ap.add_argument("--batch-size", type=int, default=None, help="覆寫 per_device_train_batch_size")
     ap.add_argument("--grad-accum", type=int, default=None, help="覆寫 gradient_accumulation_steps")
@@ -34,7 +36,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument("--no-weighted", action="store_true",
                     help="關閉 per-source 加權取樣（除錯/對比用）")
     ap.add_argument("--extended-targets", action="store_true",
-                    help="LoRA 額外納入 30 層 linear_attn 投影（進階實驗）")
+                    help="LoRA 額外納入 48 層 linear_attn 投影（進階實驗）")
     ap.add_argument("--no-wandb", action="store_true",
                     help="關閉 wandb 上報（離線/除錯；report_to=[]，不需 WANDB_API_KEY）")
     return ap.parse_args(argv)
@@ -66,6 +68,16 @@ def build_sft_config(args: argparse.Namespace):
     from trl import SFTConfig
 
     smoke = args.smoke
+    is_4bit = args.quantize == "4bit"
+    # 4-bit 與 bf16 路徑各自一組校準過的 batch / grad_accum 預設（見 training/config.py）。
+    default_bs = (
+        config.QLORA_PER_DEVICE_TRAIN_BATCH_SIZE if is_4bit
+        else config.PER_DEVICE_TRAIN_BATCH_SIZE
+    )
+    default_ga = (
+        config.QLORA_GRADIENT_ACCUMULATION_STEPS if is_4bit
+        else config.GRADIENT_ACCUMULATION_STEPS
+    )
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     default_dir = config.OUTPUT_DIR / "smoke" if smoke else config.RUN_DIR
     output_dir = args.output_dir or str(default_dir)
@@ -74,8 +86,8 @@ def build_sft_config(args: argparse.Namespace):
         bf16=True,
         bf16_full_eval=True,  # eval 也走 bf16（不 upcast fp32），更快更省 VRAM
         prediction_loss_only=True,  # eval 只需 eval_loss；不累積 248k-vocab logits（防 OOM、加速）
-        per_device_train_batch_size=args.batch_size or (1 if smoke else config.PER_DEVICE_TRAIN_BATCH_SIZE),
-        gradient_accumulation_steps=args.grad_accum or (1 if smoke else config.GRADIENT_ACCUMULATION_STEPS),
+        per_device_train_batch_size=args.batch_size or (1 if smoke else default_bs),
+        gradient_accumulation_steps=args.grad_accum or (1 if smoke else default_ga),
         per_device_eval_batch_size=config.PER_DEVICE_EVAL_BATCH_SIZE,
         learning_rate=config.LEARNING_RATE,
         lr_scheduler_type=config.LR_SCHEDULER_TYPE,
@@ -139,8 +151,11 @@ def main(argv=None):
     from .weighted_trainer import WeightedSFTTrainer
 
     target_modules = config.TARGET_MODULES_WITH_LINEAR_ATTN if args.extended_targets else None
-    print(">> 載入 bf16 模型並掛 LoRA …")
-    model, processor = load_lora_model_and_processor(target_modules=target_modules)
+    load_in_4bit = args.quantize == "4bit"
+    print(f">> 載入模型並掛 LoRA（quantize={args.quantize}）…")
+    model, processor = load_lora_model_and_processor(
+        target_modules=target_modules, load_in_4bit=load_in_4bit
+    )
     report_model(model)
     assert_only_lora_trainable(model)
 

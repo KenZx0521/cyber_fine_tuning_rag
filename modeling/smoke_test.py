@@ -3,7 +3,8 @@
 這是「能載入地端」的驗證進入點（對齊 build_dataset.py 的 argparse + main(argv) 風格）。
 
 用法：
-    uv run python -m modeling.smoke_test
+    uv run python -m modeling.smoke_test                    # bf16 推論（預設）
+    uv run python -m modeling.smoke_test --quantize 4bit    # 4-bit 推論（驗證 QLoRA 量化路徑）
     uv run python -m modeling.smoke_test --no-generate      # 只載入＋診斷
     uv run python -m modeling.smoke_test --max-new-tokens 128
 """
@@ -30,13 +31,26 @@ def _build_messages() -> list[dict]:
     ]
 
 
-def run(max_new_tokens: int, do_generate: bool, max_gpu_mem: str | None = None) -> None:
-    print(f"載入模型：{config.MODEL_ID}")
+def run(
+    max_new_tokens: int,
+    do_generate: bool,
+    max_gpu_mem: str | None = None,
+    quantize: str = "bf16",
+) -> None:
+    print(f"載入模型：{config.MODEL_ID}（quantize={quantize}）")
     max_memory = (
         {0: max_gpu_mem, "cpu": config.CPU_MEM_BUDGET} if max_gpu_mem else None
     )
+    quantization_config = None
+    if quantize == "4bit":
+        # 推論層為了驗證 QLoRA 量化路徑也可選 4-bit；訓練則由 training/train.py --quantize 控制。
+        from training.quant_loader import build_bnb_config
+
+        quantization_config = build_bnb_config(load_in_4bit=True)
     t0 = time.perf_counter()
-    model, processor = load_model_and_processor(max_memory=max_memory)
+    model, processor = load_model_and_processor(
+        max_memory=max_memory, quantization_config=quantization_config
+    )
     print(f"載入耗時：{time.perf_counter() - t0:.1f}s")
 
     report_diagnostics(model)
@@ -82,6 +96,12 @@ def main(argv: list[str] | None = None) -> None:
         "--no-generate", action="store_true", help="只載入並印診斷，不生成"
     )
     parser.add_argument(
+        "--quantize",
+        choices=["bf16", "4bit"],
+        default="bf16",
+        help="量化策略：bf16=完整精度（推論預設）；4bit=NF4 QLoRA 路徑驗證",
+    )
+    parser.add_argument(
         "--max-gpu-mem",
         default=None,
         help='手動指定 GPU 權重上限（如 "68GiB"）；預設依可用 VRAM 自動預留 headroom',
@@ -91,6 +111,7 @@ def main(argv: list[str] | None = None) -> None:
         args.max_new_tokens,
         do_generate=not args.no_generate,
         max_gpu_mem=args.max_gpu_mem,
+        quantize=args.quantize,
     )
 
 

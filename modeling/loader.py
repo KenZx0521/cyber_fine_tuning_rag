@@ -32,26 +32,31 @@ def load_model_and_processor(
     attn_impl: str = config.ATTN_IMPL,
     device_map: str | dict = config.DEVICE_MAP,
     max_memory: dict | None = None,
+    quantization_config=None,
 ):
-    """以 bf16 載入完整 checkpoint。回傳 (model, processor)。
+    """以 bf16（或 4-bit）載入完整 checkpoint。回傳 (model, processor)。
 
     - transformers 5.x 用 `dtype=`（舊 `torch_dtype` 已棄用）；接受字串 "bfloat16"。
     - device_map="auto" 由 accelerate 放置，VRAM 不足時自動 offload 到 CPU RAM。
     - max_memory 未指定且 device_map="auto" 時，依目前可用 VRAM 自動預留 headroom
       （見 _auto_max_memory），避免權重幾乎塞滿 GPU 後在生成階段 OOM。
+    - quantization_config：選填 BitsAndBytesConfig；推論預設不量化（bf16），
+      smoke_test 可透過 --quantize 4bit 走 4-bit 路徑（由 training.quant_loader 構造）。
     """
     if device_map == "auto" and max_memory is None:
         max_memory = _auto_max_memory()
 
     processor = AutoProcessor.from_pretrained(model_id)
-    model = AutoModelForImageTextToText.from_pretrained(
-        model_id,
+    kwargs = dict(
         dtype=dtype,
         device_map=device_map,
         attn_implementation=attn_impl,
         low_cpu_mem_usage=True,
         max_memory=max_memory,
     )
+    if quantization_config is not None:
+        kwargs["quantization_config"] = quantization_config
+    model = AutoModelForImageTextToText.from_pretrained(model_id, **kwargs)
     model.eval()
     return model, processor
 
@@ -84,6 +89,13 @@ def report_diagnostics(model) -> None:
     print(f"總參數量：{total / 1e9:.2f} B")
     for dt, n in dtype_counts.most_common():
         print(f"  {str(dt):24} {n / 1e9:6.2f} B ({n / total * 100:5.1f}%)")
+
+    # --- 量化摘要（若有）---
+    quant_cfg = getattr(getattr(model, "config", None), "quantization_config", None)
+    if quant_cfg is not None:
+        qtype = getattr(quant_cfg, "quant_method", None) or type(quant_cfg).__name__
+        skip = getattr(quant_cfg, "llm_int8_skip_modules", None)
+        print(f"量化：{qtype}（skip_modules={skip}）")
 
     # --- device_map 放置（cuda vs cpu/disk 模組數）---
     dmap = getattr(model, "hf_device_map", None)

@@ -197,7 +197,7 @@ def _train_args(**overrides):
     base = dict(
         smoke=False, epochs=None, batch_size=None, grad_accum=None,
         max_length=None, output_dir=None, no_weighted=False,
-        extended_targets=False, no_wandb=False,
+        extended_targets=False, no_wandb=False, quantize="4bit",
     )
     base.update(overrides)
     return argparse.Namespace(**base)

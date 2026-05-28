@@ -6,6 +6,10 @@
 
 訓練情境（使用者已拍板）：2 epochs + α=0.5 / cap=3（已把雜燴的 primus/general 權重設 0 排除取樣），
 沿用既有 data/processed/sampler_weights.json。
+
+量化策略（使用者已拍板，2026-05-28 換模型 + 重啟 QLoRA）：
+  - 預設 4-bit QLoRA（新模型為 dense，bnb 可量化全部 nn.Linear，bnb#1849 不再阻擋）
+  - bf16 LoRA 作為 fallback（--quantize bf16）—— 維持單一 trainer + CLI 切換的簡潔
 """
 
 from __future__ import annotations
@@ -31,21 +35,22 @@ ADAPTER_DIR = RUN_DIR / "final-adapter"  # 訓練結束的最終 LoRA adapter（
 MERGED_DIR = REPO_ROOT / "outputs" / "qlora-cyber-merged"  # merge 後的完整 bf16 權重
 
 # --- LoRA ---
-# target_modules 決策（依 meta-device named_modules dump 校正，見 plan ⚠️#2/#3）：
-# 模型每層結構為
-#   self_attn(10 層 full-attn).{q,k,v,o}_proj           —— 標準 nn.Linear
-#   linear_attn(30 層 GatedDeltaNet).{in_proj_*,out_proj} —— Linear，但接 SSM(fp32) 核心
-#   mlp.experts (Qwen3_5MoeExperts)                       —— fused 3D Parameter（非 Linear）
-#   mlp.gate (Qwen3_5MoeTopKRouter)                       —— router
-#   mlp.shared_expert.{gate,up,down}_proj                 —— dense FFN，每 token 必過、梯度密集
-#   mlp.shared_expert_gate                                —— 門控 Linear
-# 預設掛 LoRA 於：full-attn 投影 + shared_expert 的 dense FFN
-#   → 覆蓋 10 層 attention + 全 40 層 dense FFN 容量，皆為梯度密集路徑，穩定。
+# target_modules 決策（依 meta-device named_modules dump 校正，見 scripts/dump_target_modules.py）：
+# 新模型（qwen3_5 dense + VLM + hybrid attention + MTP）每層結構為
+#   self_attn(16 full-attention 層).{q,k,v,o}_proj  —— 標準 nn.Linear
+#       （attn_output_gate=true：gate 從 q_proj 用 torch.chunk 切出，q_proj 涵蓋兩者）
+#   linear_attn(48 層 GatedDeltaNet).{in_proj_qkv,in_proj_z,in_proj_b,in_proj_a,out_proj}
+#       —— Linear，但接 SSM (fp32) 核心；4-bit 量化路徑須以 BNB_4BIT_SKIP_MODULES skip 整個子樹
+#   mlp.{gate_proj,up_proj,down_proj}                —— dense FFN（每層必過、梯度密集；無 MoE）
+#   visual.* (Qwen3_5 ViT 27 層).{linear_fc1,linear_fc2,qkv,proj} —— 凍結 + 不掛 LoRA
+#   mtp.layers.*                                     —— transformers 5.9+ 載入時依
+#       _keys_to_ignore_on_load_unexpected 直接丟棄（named_parameters 不會出現）
+# 預設掛 LoRA 於：full-attn 投影 + dense FFN
+#   → 命中 16 attn × 4 + 64 mlp × 3 = 256 個 Linear，全為梯度密集路徑。
 # 刻意排除：
-#   - routed experts（fused Parameter，PEFT 掛不上且梯度稀疏 8/256）
-#   - router gate / shared_expert_gate（門控敏感，擾動易使專家分配崩潰）
-#   - linear_attn 投影（SSM fp32 路徑，首訓保守不動；穩定後可實驗加入，見下）
-#   - vision tower / lm_head / embed_tokens
+#   - linear_attn 投影（SSM fp32 路徑，首訓保守不動；穩定後可用 --extended-targets 加入）
+#   - vision tower（VLM 多模態能力不在本次訓練目標）
+#   - lm_head / embed_tokens（248k vocab，量化或微調都會影響輸出分佈）
 LORA_R = 16
 LORA_ALPHA = 32  # 2×r 慣例
 LORA_DROPOUT = 0.05
@@ -54,12 +59,13 @@ TARGET_MODULES = [
     "q_proj",
     "k_proj",
     "v_proj",
-    "o_proj",  # full-attn（僅命中 10 層 self_attn，linear_attn 無此命名）
+    "o_proj",  # full-attn 4 投影（命中 16 層 self_attn；linear_attn 無此命名）
     "gate_proj",
     "up_proj",
-    "down_proj",  # 僅命中 shared_expert（routed experts 為 fused、無此子模組名）
+    "down_proj",  # dense FFN 3 投影（命中全 64 層 mlp；vision 用 linear_fc1/2，不衝突）
 ]
-# 進階實驗用：額外納入 linear_attn 投影，覆蓋 30 層 token-mixing（首訓不啟用）。
+# 進階實驗用：額外納入 linear_attn 投影，覆蓋 48 層 token-mixing（首訓不啟用）。
+# 注意：啟用 --extended-targets 同時跑 4-bit QLoRA 時，這些子樹 LoRA 會在 bf16 上掛（因 SKIP）。
 TARGET_MODULES_WITH_LINEAR_ATTN = TARGET_MODULES + [
     "in_proj_qkv",
     "in_proj_z",
@@ -68,27 +74,39 @@ TARGET_MODULES_WITH_LINEAR_ATTN = TARGET_MODULES + [
     "out_proj",
 ]
 
-# --- 載入策略：bf16 LoRA（非量化） ---
-# 原計畫 4-bit QLoRA，但實測此模型 97% 參數在 fused MoE experts（Qwen3_5MoeExperts
-# 的 3D Parameter）：bitsandbytes 只量化 nn.Linear、無法量化 fused experts（transformers
-# v5 已知問題 bnb#1849）—— 4-bit 反因 60GiB experts 維持 bf16 而省不到記憶體，且
-# prepare_model_for_kbit_training 把 experts upcast fp32 會 OOM。對症套件 woct0rdho 亦
-# 不支援本架構（VLM + GatedDeltaNet + transformers 5）。
-# 故改 bf16 LoRA：模型 bf16 約 65GiB，單卡 95GiB 可容納，LoRA 仍掛 attention +
-# shared_expert FFN，達成相同的單卡 LoRA 微調目標。
+# --- 4-bit QLoRA 量化（quant_loader.build_bnb_config 的預設來源） ---
+BNB_4BIT_QUANT_TYPE = "nf4"           # QLoRA 標準
+BNB_4BIT_COMPUTE_DTYPE = "bfloat16"   # 由 quant_loader 轉成 torch.bfloat16
+BNB_4BIT_USE_DOUBLE_QUANT = True      # 二次量化壓縮 quant constants（再省 ~0.4 bit/param）
+# 跳過量化的子模組（substring match）：
+#   - "visual"：凍結；保 bf16 維持多模態推論精度
+#   - "lm_head"：248k vocab × 5120，量化會影響 last-token logits 精度
+#   - "linear_attn"：48 層 GatedDeltaNet 子樹整段；SSM 內走 fp32，bf16 input × 4-bit weight
+#     會在 SSM 邊界出 dtype 危險（高風險 R1）
+BNB_4BIT_SKIP_MODULES = ["visual", "lm_head", "linear_attn"]
+
+# --- 載入策略：4-bit QLoRA 為預設，bf16 LoRA 為 fallback ---
+# 新模型（qwen3_5 dense）已無 fused MoE experts，全是 nn.Linear → bitsandbytes 可正常量化，
+# bnb#1849 不再阻擋。預設走 4-bit QLoRA（NF4 + bf16 compute + double quant）：
+#   - 權重 VRAM：bf16 ~56 GiB → 4-bit ~14-16 GiB，省下 ~40 GiB 用於更大 batch / 關 grad ckpt
+#   - linear_attn 子樹（48 層 GatedDeltaNet）由 BNB_4BIT_SKIP_MODULES 跳過保 bf16，SSM 邊界安全
+# bf16 LoRA 仍保留為 fallback（--quantize bf16），程式路徑差異最小化：
+#   - lora_loader.load_base(load_in_4bit=False) 走 dtype=bfloat16 直接載入（與舊行為一致）
+#   - 不在 bf16 路徑呼叫 prepare_model_for_kbit_training（會把 bf16 全升 fp32 OOM）
 # device_map 全塞單卡（不 offload；訓練時 offload 會災難性變慢）。
 DEVICE_MAP: str | dict = {"": 0}
 
 # --- 訓練超參（情境：2 epochs + α=0.5 / cap=3；單卡 RTX PRO 6000 95GiB） ---
-# 加速調整（2026-05-28）：本模型為 A3B 稀疏 MoE，吞吐量取決於「每次 forward 餵給 expert 的
-# token 數」。原 bs=2 嚴重餵不飽 256 個 expert（每 expert 僅 ~38 token、GEMM 受記憶體頻寬限制）。
-# 故 bs 2→3（grad_accum 8→5），並啟用長度分組取樣砍 padding 浪費。
-# bs=4 實測 OOM：248k-vocab 的 logits（compute_loss 的 shift_logits.contiguous）在最長 batch
-# (4×2048) 需 ~7.6GiB 連續記憶體；每增 1 bs 約 ~8GiB，weights 固定 65GiB → bs=4 峰值 ~98GiB 超出
-# 95GiB；bs=3 峰值 ~90GiB 可容（留 ~5GiB）。搭 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True 減碎片。
+# bf16 路徑（fallback）的歷史校準：本檔上版為 MoE 模型校的 bs=3 / grad_accum=5（有效 batch=15）。
+# 新模型為 dense，bf16 權重 ~56 GiB（比舊 ~65 GiB 少 ~9 GiB），bf16 bs=3 仍合理；保留作 fallback。
+# 4-bit QLoRA 路徑（預設）的起點：權重 ~14-16 GiB → batch 與 max_length 可放寬。
+# 起點 bs=6 / grad_accum=3（有效 batch=18）；smoke 通過後再實測 lock。
+# bs 上限受 248k-vocab logits 連續記憶體限制（每增 bs ~+8 GiB at 2048 seqlen）。
 NUM_TRAIN_EPOCHS = 2
-PER_DEVICE_TRAIN_BATCH_SIZE = 3  # MoE expert GEMM 餵料↑50%；bs=4 因 logits 連續複製 OOM
-GRADIENT_ACCUMULATION_STEPS = 5  # 有效 batch = 3×5 = 15（≈ 原 16）
+PER_DEVICE_TRAIN_BATCH_SIZE = 3  # bf16 fallback 路徑（--quantize bf16）
+GRADIENT_ACCUMULATION_STEPS = 5  # bf16 fallback：有效 batch = 3×5 = 15
+QLORA_PER_DEVICE_TRAIN_BATCH_SIZE = 6  # 4-bit 路徑起點；smoke 通過後再實測 lock
+QLORA_GRADIENT_ACCUMULATION_STEPS = 3  # 4-bit 路徑：有效 batch = 6×3 = 18
 # eval 時訓練 allocator 已保留 ~87GiB（峰值快取不釋放），僅剩 ~7GiB；而 248k-vocab logits 的
 # shift_logits.contiguous() 按 eval_bs 線性放大（實測 bs=8 需 ~10.5GiB → OOM）。bs=2（~2.6GiB）穩妥。
 # 註：prediction_loss_only 只避免「跨 batch 累積預測」，消不掉單 batch 的 logits 峰值，故須小 eval batch。

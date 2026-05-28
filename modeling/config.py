@@ -17,11 +17,16 @@ from preprocessing.config import SECURITY_SYSTEM_PROMPT
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # --- 目標模型 ---
-# huihui-ai 的 abliterated 變體；架構為 qwen3_5_moe（多模態 VLM + 混合線性注意力 MoE）。
+# huihui-ai 的 abliterated 變體；架構為 qwen3_5（多模態 VLM + 混合注意力 dense；含 MTP 1 層）。
+# 與舊 qwen3_5_moe 的關鍵差異：
+#   - Dense MLP（mlp_only_layers: []，無 fused experts）→ bnb 可量化全部 nn.Linear，4-bit QLoRA 可用
+#   - 64 層 hybrid attention：full_attention_interval=4 → 16 full-attn + 48 GatedDeltaNet linear_attn
+#   - attn_output_gate=true（gate 從 q_proj chunk 出來，不增加額外 Linear）
+#   - mtp_num_hidden_layers=1（transformers 5.9+ 載入時依 _keys_to_ignore_on_load_unexpected 丟棄）
 # 官方唯一受支援載入路徑：AutoProcessor + AutoModelForImageTextToText（不需 trust_remote_code）。
-MODEL_ID = "huihui-ai/Huihui-Qwen3.6-35B-A3B-Claude-4.7-Opus-abliterated"
-# 完整 checkpoint 為 26 個 safetensors shard（用於下載完整性檢查）。
-EXPECTED_SHARD_COUNT = 26
+MODEL_ID = "huihui-ai/Huihui-Qwen3.5-27B-Claude-4.6-Opus-abliterated"
+# 完整 checkpoint 為 11 個 safetensors shard（bf16 ~55.5 GiB；用於下載完整性檢查）。
+EXPECTED_SHARD_COUNT = 11
 
 # --- 載入預設值 ---
 # bf16 完整載入（不量化）。以字串傳給 from_pretrained(dtype=...)；SSM 層依 config 內
@@ -34,9 +39,9 @@ DEVICE_MAP = "auto"
 # 預期 GPU 計算能力（Blackwell = sm_120）；smoke test 用來提示是否抓到正確的 torch wheel。
 EXPECTED_CUDA_CAPABILITY = (12, 0)
 
-# device_map="auto" 時，GPU 預留給 activation/KV cache 的空間（GiB）。模型權重約 72GB、
-# 可用 VRAM 約 75GB 偏緊，全塞 GPU 會在生成階段 OOM；預留 headroom，超出的權重由
-# accelerate offload 到 CPU。
+# device_map="auto" 時，GPU 預留給 activation/KV cache 的空間（GiB）。新模型 bf16 ~56 GiB
+# 在 95 GiB 卡上綽綽有餘，理論上不需 offload；headroom 仍保留以兼顧 4-bit + 大 batch eval
+# 或長 max_length 的峰值。
 GPU_HEADROOM_GIB = 6
 CPU_MEM_BUDGET = "120GiB"
 

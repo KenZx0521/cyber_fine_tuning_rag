@@ -34,7 +34,14 @@ def download(model_id: str = config.MODEL_ID, high_performance: bool = True) -> 
 
 
 def _count_shards(path: str) -> int:
-    return len(sorted(Path(path).glob("model-*-of-*.safetensors")))
+    """支援兩種 shard 命名格式：
+    - model-XXXXX-of-XXXXX.safetensors（舊標準）
+    - model.safetensors-XXXXX-of-XXXXX.safetensors（Huihui-Qwen3.5-27B 使用）
+    """
+    p = Path(path)
+    return len(sorted(p.glob("model-*-of-*.safetensors"))) + len(
+        sorted(p.glob("model.safetensors-*-of-*.safetensors"))
+    )
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -48,7 +55,7 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     print(f"開始下載：{args.model_id}")
-    print(f"（約 72GB / 預期 {config.EXPECTED_SHARD_COUNT} shards，可中斷續傳）")
+    print(f"（約 55GB / 預期 {config.EXPECTED_SHARD_COUNT} shards，可中斷續傳）")
     path = download(args.model_id, high_performance=not args.no_fast)
 
     n = _count_shards(path)

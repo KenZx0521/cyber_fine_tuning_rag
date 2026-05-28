@@ -5,6 +5,8 @@
 
 QLoRA 標準做法：在 bf16（非量化）base 上 merge —— LoRA adapter 權重本身是 bf16，
 合進 bf16 base 不引入 4-bit 量化誤差（切勿在 4-bit base 上 merge）。
+無論訓練走 4-bit QLoRA 或 bf16 LoRA，此 merge 路徑完全一致（modeling.loader 不傳
+quantization_config 時即走 bf16 載入）。
 base 預設以 device_map="cpu" 載入：merge 是純權重運算、不需 GPU，且避免 offload
 狀態下的 device mismatch。
 """
