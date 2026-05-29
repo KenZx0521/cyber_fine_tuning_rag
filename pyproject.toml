@@ -8,6 +8,7 @@ dependencies = [
     "datasets>=4.8.5",
     # huggingface-hub 1.x 已無 [hf-transfer] extra；高效下載改由其內建相依 hf_xet（Xet）提供。
     "huggingface-hub>=1.16.1",
+    "liger-kernel>=0.8.0",
     "pandas>=3.0.3",
     "peft>=0.19.1",
     "pillow>=12.2.0",

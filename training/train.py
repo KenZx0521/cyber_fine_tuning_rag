@@ -26,8 +26,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--smoke", action="store_true",
                     help="煙霧測試：極小子集 + 少步，快速驗證整條訓練路徑能跑通")
-    ap.add_argument("--quantize", choices=["4bit", "bf16"], default="4bit",
-                    help="量化策略：4bit=NF4 QLoRA（預設）；bf16=bf16 LoRA fallback")
+    ap.add_argument("--quantize", choices=["4bit", "bf16"], default="bf16",
+                    help="量化策略：bf16=bf16 LoRA（預設；Blackwell Tensor Core 直跑，最快）；4bit=NF4 QLoRA fallback")
     ap.add_argument("--epochs", type=int, default=None, help="覆寫 num_train_epochs")
     ap.add_argument("--batch-size", type=int, default=None, help="覆寫 per_device_train_batch_size")
     ap.add_argument("--grad-accum", type=int, default=None, help="覆寫 gradient_accumulation_steps")
@@ -39,6 +39,10 @@ def parse_args(argv=None) -> argparse.Namespace:
                     help="LoRA 額外納入 48 層 linear_attn 投影（進階實驗）")
     ap.add_argument("--no-wandb", action="store_true",
                     help="關閉 wandb 上報（離線/除錯；report_to=[]，不需 WANDB_API_KEY）")
+    ap.add_argument("--liger", action="store_true",
+                    help="啟用 Liger Kernel：fused linear CE（不物化 248k-vocab logits）+ fused RMSNorm/SwiGLU。"
+                         "本機 RTX PRO 6000 Blackwell 實測本路徑（bf16+dense）沒 throughput 收益（Triton SM12.0 未調優），"
+                         "但會省 ~20GiB VRAM。要拉長 max_length 或加 extended-targets 時才需要。")
     return ap.parse_args(argv)
 
 
@@ -86,6 +90,11 @@ def build_sft_config(args: argparse.Namespace):
         bf16=True,
         bf16_full_eval=True,  # eval 也走 bf16（不 upcast fp32），更快更省 VRAM
         prediction_loss_only=True,  # eval 只需 eval_loss；不累積 248k-vocab logits（防 OOM、加速）
+        # Liger Kernel：fused linear CE 不物化 [bs, seq, 248k] logits（省 ~20GiB）+ fused RMSNorm/SwiGLU。
+        # 透過 model.config.model_type='qwen3_5' 自動 monkey-patch（liger_kernel 0.8 已支援）。
+        # 本機 Blackwell SM12.0 + bf16 + dense 36B 實測沒 throughput 收益，預設關閉；
+        # 要拉長 max_length 或加 extended-targets 時用 --liger 啟用換 VRAM 餘量。
+        use_liger_kernel=args.liger,
         per_device_train_batch_size=args.batch_size or (1 if smoke else default_bs),
         gradient_accumulation_steps=args.grad_accum or (1 if smoke else default_ga),
         per_device_eval_batch_size=config.PER_DEVICE_EVAL_BATCH_SIZE,

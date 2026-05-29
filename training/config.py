@@ -96,16 +96,22 @@ BNB_4BIT_SKIP_MODULES = ["visual", "lm_head", "linear_attn"]
 # device_map 全塞單卡（不 offload；訓練時 offload 會災難性變慢）。
 DEVICE_MAP: str | dict = {"": 0}
 
-# --- 訓練超參（情境：2 epochs + α=0.5 / cap=3；單卡 RTX PRO 6000 95GiB） ---
-# bf16 路徑（fallback）的歷史校準：本檔上版為 MoE 模型校的 bs=3 / grad_accum=5（有效 batch=15）。
-# 新模型為 dense，bf16 權重 ~56 GiB（比舊 ~65 GiB 少 ~9 GiB），bf16 bs=3 仍合理；保留作 fallback。
-# 4-bit QLoRA 路徑（預設）的起點：權重 ~14-16 GiB → batch 與 max_length 可放寬。
-# 起點 bs=6 / grad_accum=3（有效 batch=18）；smoke 通過後再實測 lock。
-# bs 上限受 248k-vocab logits 連續記憶體限制（每增 bs ~+8 GiB at 2048 seqlen）。
+# --- 訓練超參（情境：2 epochs + α=0.5 / cap=3；單卡 RTX PRO 6000 96GiB） ---
+# 2026-05-28 吞吐 benchmark（smoke 4-step + length grouping 部分發揮，仍有相對意義）：
+#   4-bit bs=6 ga=3 ml=2048：0.643 samples/s → 估全量 ~75 hr ←歷史預設
+#   bf16  bs=3 ga=5 ml=1536：0.709 samples/s → 估 ~58 hr
+#   bf16  bs=4 ga=5 ml=1536：0.921 samples/s → 估 ~46 hr ★甜蜜點（peak 84/96GiB，margin 11GiB）
+#   bf16  bs=5 ga=4 ml=1536：0.887 samples/s → 估 ~48 hr（peak 92/96GiB，margin 4GiB）
+#   bf16  bs=6 ga=3 ml=1536：0.784 samples/s → 估 ~54 hr（peak 95/96GiB ⚠️ 紅線）
+# 關鍵發現：
+#   1) Blackwell Tensor Core 直跑 bf16，4-bit dequant 反而成淨負擔（bf16 比 4-bit 快 ~40%）
+#   2) dense 36B 在 bs=4 即達計算飽和，再放大 bs 反而 throughput 下降
+#   3) Liger Kernel 砍 logits 物化（VRAM -20GiB）但本機 throughput 沒提升（Triton SM12.0 未調優）
+# 故預設改 bf16 LoRA bs=4 ga=5 max_length=1536（截到 p95+，移除 5% 長尾換來 1.43× 吞吐）
 NUM_TRAIN_EPOCHS = 2
-PER_DEVICE_TRAIN_BATCH_SIZE = 3  # bf16 fallback 路徑（--quantize bf16）
-GRADIENT_ACCUMULATION_STEPS = 5  # bf16 fallback：有效 batch = 3×5 = 15
-QLORA_PER_DEVICE_TRAIN_BATCH_SIZE = 6  # 4-bit 路徑起點；smoke 通過後再實測 lock
+PER_DEVICE_TRAIN_BATCH_SIZE = 4  # bf16 路徑（預設）：smoke 量峰值 84/96GiB
+GRADIENT_ACCUMULATION_STEPS = 5  # bf16：有效 batch = 4×5 = 20
+QLORA_PER_DEVICE_TRAIN_BATCH_SIZE = 6  # 4-bit 路徑（--quantize 4bit）：起點；本機實測比 bf16 慢，保留 fallback
 QLORA_GRADIENT_ACCUMULATION_STEPS = 3  # 4-bit 路徑：有效 batch = 6×3 = 18
 # eval 時訓練 allocator 已保留 ~87GiB（峰值快取不釋放），僅剩 ~7GiB；而 248k-vocab logits 的
 # shift_logits.contiguous() 按 eval_bs 線性放大（實測 bs=8 需 ~10.5GiB → OOM）。bs=2（~2.6GiB）穩妥。
@@ -116,8 +122,10 @@ LR_SCHEDULER_TYPE = "cosine"
 WARMUP_RATIO = 0.03
 WEIGHT_DECAY = 0.0  # LoRA adapter 小，通常不用 weight decay
 MAX_GRAD_NORM = 1.0
-# p50=616、p95=1475、p99=2108、max=7969；2048 涵蓋 p99，記憶體可控。
-MAX_LENGTH = 2048
+# p50=616、p95=1475、p99=2108、max=7969；1536 涵蓋 p95（截掉 ~5% 長尾），
+# 相對 2048 attention/logits VRAM 線性縮減 ~25% 換 1.4× 吞吐。
+# 若要避免任何截斷再改回 2048（須同步降 bs 避免 OOM）。
+MAX_LENGTH = 1536
 # LoRA optimizer state 極小（僅 adapter 參數），不需 paged → 改 fused，移除 CPU↔GPU paging 同步停頓。
 OPTIM = "adamw_torch_fused"
 GRADIENT_CHECKPOINTING = True  # 65GiB 權重下必開（關閉會 OOM）
